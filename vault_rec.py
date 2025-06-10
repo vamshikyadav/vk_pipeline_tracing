@@ -6,23 +6,35 @@ from hvac.exceptions import InvalidPath
 # ENV VARS
 VAULT_ADDR = os.getenv('VAULT_ADDR', 'http://127.0.0.1:8200')
 VAULT_TOKEN = os.getenv('VAULT_TOKEN')
-ROOT_NAMESPACE = os.getenv('VAULT_NAMESPACE', '')  # leave blank for root
+BASE_NAMESPACE = os.getenv('VAULT_NAMESPACE', '')  # e.g. "platform/"
 
 # Create Vault client
+
 def get_client(namespace=None):
     return hvac.Client(
         url=VAULT_ADDR,
         token=VAULT_TOKEN,
-        namespace=namespace or ROOT_NAMESPACE
+        namespace=namespace or BASE_NAMESPACE
     )
 
-def list_namespaces(client):
-    try:
-        response = client.secrets.kv.v1.list_secrets(path='identity/namespace')
-        return [item.strip('/') for item in response['data']['keys']]
-    except Exception as e:
-        print(f"[WARN] Could not list namespaces: {e}")
-        return []
+def list_subnamespaces(client, base_ns):
+    base_ns = base_ns.rstrip('/') + '/' if base_ns else ''
+    discovered = set()
+    stack = [base_ns]
+
+    while stack:
+        current = stack.pop()
+        discovered.add(current)
+        try:
+            response = client.secrets.kv.v1.list_secrets(path=f"identity/namespace/{current.strip('/')}")
+            subkeys = response.get("data", {}).get("keys", [])
+            for key in subkeys:
+                if key.endswith('/'):
+                    stack.append(current + key)
+        except Exception as e:
+            continue
+
+    return sorted(discovered)
 
 def get_kv_mounts(client):
     try:
@@ -33,14 +45,15 @@ def get_kv_mounts(client):
     kv_mounts = {}
     for path, config in mounts.items():
         if config["type"] == "kv":
-            version = config.get("options", {}).get("version", "1")
+            options = config.get("options") or {}
+            version = options.get("version", "1")
             kv_mounts[path] = int(version)
     return kv_mounts
 
 def list_kv2(client, path, mount_point):
     try:
         response = client.secrets.kv.v2.list_secrets(path=path, mount_point=mount_point)
-        return response["data"]["keys"]
+        return response["data"].get("keys", [])
     except InvalidPath:
         return []
 
@@ -53,7 +66,7 @@ def read_kv2(client, path, mount_point):
 def list_kv1(client, full_path):
     try:
         response = client.secrets.kv.v1.list_secrets(path=full_path)
-        return response["data"]["keys"]
+        return response["data"].get("keys", [])
     except InvalidPath:
         return []
 
@@ -105,21 +118,17 @@ def main():
         print("Vault authentication failed.")
         return
 
-    # Get sub-namespaces under root
-    namespaces = list_namespaces(root_client)
-    if ROOT_NAMESPACE:
-        namespaces = [ROOT_NAMESPACE + ns for ns in namespaces]
-    namespaces.insert(0, ROOT_NAMESPACE)  # Include root namespace
+    namespaces = list_subnamespaces(root_client, BASE_NAMESPACE)
 
     for ns in namespaces:
-        ns_display = ns or "[root]"
+        ns_display = ns.rstrip('/') or "/"
         print(f"\n🚀 Crawling namespace: {ns_display}")
-        client = get_client(ns)
+        client = get_client(ns.rstrip('/'))
 
         kv_mounts = get_kv_mounts(client)
         for mount_point, version in kv_mounts.items():
             print(f"  → Mount: {mount_point} (KV v{version})")
-            crawl_kv(client, mount_point, mount_point, version, all_results, ns or "/")
+            crawl_kv(client, mount_point, mount_point, version, all_results, ns_display)
 
     write_to_csv(all_results)
     print("\n✅ Done. Secrets saved to vault_secrets.csv")
