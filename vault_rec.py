@@ -17,61 +17,63 @@ def is_kv_v2(mount_path):
         return False
 
 
-def list_secrets_recursively(mount_path, path="", is_v2=False):
+def list_secrets_deep(mount_path, namespace, base_path="", is_v2=False):
     secrets = []
+    headers = {"X-Vault-Namespace": namespace} if namespace else {}
+
     try:
         if is_v2:
-            result = client.secrets.kv.v2.list_secrets(path=path, mount_point=mount_path.rstrip('/'))
-            keys = result["data"]["keys"]
+            endpoint = f"/v1/{mount_path}metadata/{base_path}".rstrip("/") + "?list=true"
         else:
-            result = client.secrets.kv.v1.list_secrets(path=path, mount_point=mount_path.rstrip('/'))
-            keys = result["data"]["keys"]
+            endpoint = f"/v1/{mount_path}{base_path}".rstrip("/") + "?list=true"
+
+        result = client.adapter.get(endpoint, headers=headers)
+        keys = result.json()["data"]["keys"]
     except Exception:
         return secrets
 
     for key in keys:
+        full_path = f"{base_path}{key}"
         if key.endswith("/"):
-            secrets += list_secrets_recursively(mount_path, path + key, is_v2)
+            secrets += list_secrets_deep(mount_path, namespace, full_path, is_v2)
         else:
-            secrets.append(path + key)
+            secrets.append(full_path)
     return secrets
 
 
 def get_kv_mounts():
+    headers = {"X-Vault-Namespace": VAULT_NAMESPACE} if VAULT_NAMESPACE else {}
     try:
-        headers = {"X-Vault-Namespace": VAULT_NAMESPACE} if VAULT_NAMESPACE else {}
         response = client.adapter.get("/v1/sys/mounts", headers=headers)
-        data = response if isinstance(response, dict) else response.json()
-        mounts = []
-        for mount, info in data.items():
-            if isinstance(info, dict) and info.get("type") == "kv":
-                mounts.append(mount)
-        return mounts
+        mounts = response.json()
+        return [m for m in mounts if mounts[m]["type"] == "kv"]
     except Exception as e:
-        print(f"❌ Cannot get mounts: {e}")
+        print(f"❌ Could not get mounts: {e}")
         return []
 
 
 def export_to_csv():
     mounts = get_kv_mounts()
     with open("vault_secrets.csv", "w", newline="") as csvfile:
-        fieldnames = ["Mount Path", "Secret Path", "KV Version"]
+        fieldnames = ["Namespace", "Mount Path", "Secret Path", "KV Version"]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
 
         for mount in mounts:
             try:
                 is_v2 = is_kv_v2(mount)
-                print(f"🔍 Scanning {mount} ({'v2' if is_v2 else 'v1'}) in namespace {VAULT_NAMESPACE or '[root]'}")
-                secrets = list_secrets_recursively(mount, is_v2=is_v2)
+                print(f"🔍 Scanning mount: {mount} ({'v2' if is_v2 else 'v1'})")
+                secrets = list_secrets_deep(mount, VAULT_NAMESPACE, "", is_v2)
+
                 for secret_path in secrets:
                     writer.writerow({
+                        "Namespace": VAULT_NAMESPACE or "root",
                         "Mount Path": mount,
                         "Secret Path": secret_path,
                         "KV Version": "v2" if is_v2 else "v1"
                     })
             except Exception as e:
-                print(f"⚠️ Error with mount {mount}: {e}")
+                print(f"⚠️ Error on mount {mount}: {e}")
 
 
 if __name__ == "__main__":
