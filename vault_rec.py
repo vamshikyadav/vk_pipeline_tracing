@@ -1,83 +1,61 @@
 import hvac
-import os
 import csv
 
-VAULT_ADDR = os.getenv("VAULT_ADDR")
-VAULT_TOKEN = os.getenv("VAULT_TOKEN")
-VAULT_NAMESPACE = os.getenv("VAULT_NAMESPACE", "")
-
-client = hvac.Client(url=VAULT_ADDR, token=VAULT_TOKEN)
-
-
-def is_kv_v2(mount_path):
-    try:
-        client.secrets.kv.v2.read_configuration(mount_point=mount_path.rstrip('/'))
-        return True
-    except Exception:
-        return False
-
-
-def list_all_secret_paths(mount_path, namespace, current_path="", is_v2=False):
-    headers = {"X-Vault-Namespace": namespace} if namespace else {}
+def list_all_secrets(client, mount_point, path='', kv_version=2):
     secrets = []
-
-    if is_v2:
-        list_url = f"/v1/{mount_path}metadata/{current_path}".rstrip("/") + "?list=true"
-    else:
-        list_url = f"/v1/{mount_path}{current_path}".rstrip("/") + "?list=true"
-
     try:
-        response = client.adapter.get(list_url, headers=headers)
-        keys = response.json()["data"]["keys"]
-    except Exception:
-        return secrets
-
-    for key in keys:
-        full_path = f"{current_path}{key}"
-        if key.endswith("/"):
-            # Recurse into subfolder
-            secrets += list_all_secret_paths(mount_path, namespace, full_path, is_v2)
+        if kv_version == 2:
+            result = client.secrets.kv.v2.list_secrets(
+                mount_point=mount_point,
+                path=path
+            )
         else:
-            secrets.append(full_path)
+            result = client.secrets.kv.v1.list_secrets(
+                mount_point=mount_point,
+                path=path
+            )
 
+        for key in result['data']['keys']:
+            full_path = f"{path}{key}"
+            if key.endswith('/'):
+                secrets.extend(list_all_secrets(client, mount_point, full_path, kv_version))
+            else:
+                secrets.append(full_path)
+    except hvac.exceptions.InvalidPath:
+        pass
     return secrets
 
-
-def get_kv_mounts():
-    headers = {"X-Vault-Namespace": VAULT_NAMESPACE} if VAULT_NAMESPACE else {}
+def detect_kv_version(client, mount_point):
     try:
-        response = client.adapter.get("/v1/sys/mounts", headers=headers)
-        mounts = response.json()
-        return [m for m in mounts if mounts[m].get("type") == "kv"]
-    except Exception as e:
-        print(f"❌ Could not get mounts: {e}")
-        return []
+        mount_config = client.sys.read_mount_configuration(mount_point=mount_point)
+        version = mount_config['data']['options'].get('version', '1')
+        return int(version)
+    except Exception:
+        return 1
 
+def main():
+    VAULT_ADDR = 'http://localhost:8200'
+    VAULT_TOKEN = 'your-root-or-client-token'
+    NAMESPACE = 'your-namespace'  # Use "" for default/root namespace
+    SECRET_ENGINE = 'secret'      # Your KV mount point
+    OUTPUT_FILE = 'vault_secrets.csv'
 
-def export_to_csv():
-    mounts = get_kv_mounts()
+    client = hvac.Client(url=VAULT_ADDR, token=VAULT_TOKEN)
+    client.adapter.session.headers.update({'X-Vault-Namespace': NAMESPACE})
 
-    with open("vault_secrets.csv", "w", newline="") as csvfile:
-        fieldnames = ["Namespace", "Mount Path", "Secret Path", "KV Version"]
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
+    kv_version = detect_kv_version(client, SECRET_ENGINE)
+    print(f"Detected KV version: {kv_version}")
 
-        for mount in mounts:
-            try:
-                is_v2 = is_kv_v2(mount)
-                print(f"🔍 Scanning mount: {mount} ({'v2' if is_v2 else 'v1'})")
-                paths = list_all_secret_paths(mount, VAULT_NAMESPACE, "", is_v2)
+    secrets = list_all_secrets(client, mount_point=SECRET_ENGINE, kv_version=kv_version)
 
-                for secret_path in paths:
-                    writer.writerow({
-                        "Namespace": VAULT_NAMESPACE or "root",
-                        "Mount Path": mount,
-                        "Secret Path": secret_path,
-                        "KV Version": "v2" if is_v2 else "v1"
-                    })
-            except Exception as e:
-                print(f"⚠️ Skipping mount {mount} due to error: {e}")
+    print(f"Found {len(secrets)} secrets. Writing to {OUTPUT_FILE}...")
+    with open(OUTPUT_FILE, mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(['Secret Path'])  # Header
+        for secret in secrets:
+            writer.writerow([secret])
 
+    print("✅ Done writing CSV.")
 
-if __name__ == "__main__":
-    export_to_csv()
+if __name__ == '__main__':
+    main()
