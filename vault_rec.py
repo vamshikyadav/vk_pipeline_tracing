@@ -1,10 +1,10 @@
 import hvac
 import csv
 import os
-from urllib.parse import urljoin
 
 VAULT_ADDR = os.getenv("VAULT_ADDR", "http://127.0.0.1:8200")
 VAULT_TOKEN = os.getenv("VAULT_TOKEN")
+VAULT_NAMESPACE = os.getenv("VAULT_NAMESPACE", "")
 
 client = hvac.Client(url=VAULT_ADDR, token=VAULT_TOKEN)
 
@@ -21,15 +21,11 @@ def list_secrets_recursively(mount_path, path="", is_v2=False):
     secrets = []
     try:
         if is_v2:
-            list_result = client.secrets.kv.v2.list_secrets(
-                path=path, mount_point=mount_path.rstrip('/')
-            )
-            keys = list_result["data"]["keys"]
+            result = client.secrets.kv.v2.list_secrets(path=path, mount_point=mount_path.rstrip('/'))
+            keys = result["data"]["keys"]
         else:
-            list_result = client.secrets.kv.v1.list_secrets(
-                path=path, mount_point=mount_path.rstrip('/')
-            )
-            keys = list_result["data"]["keys"]
+            result = client.secrets.kv.v1.list_secrets(path=path, mount_point=mount_path.rstrip('/'))
+            keys = result["data"]["keys"]
     except Exception:
         return secrets
 
@@ -37,75 +33,46 @@ def list_secrets_recursively(mount_path, path="", is_v2=False):
         if key.endswith("/"):
             secrets += list_secrets_recursively(mount_path, path + key, is_v2)
         else:
-            secrets.append((mount_path, path + key))
+            secrets.append(path + key)
     return secrets
 
 
-def list_subnamespaces(namespace):
-    namespaces = [namespace]
+def get_kv_mounts():
     try:
-        headers = {"X-Vault-Namespace": namespace} if namespace else {}
-        response = client.adapter.get("/v1/sys/namespaces", headers=headers)
+        headers = {"X-Vault-Namespace": VAULT_NAMESPACE} if VAULT_NAMESPACE else {}
+        response = client.adapter.get("/v1/sys/mounts", headers=headers)
         data = response if isinstance(response, dict) else response.json()
-        sub_ns = data.get("data", {}).get("keys", [])
-        for ns in sub_ns:
-            full_ns = f"{namespace}/{ns}".strip("/")
-            namespaces.extend(list_subnamespaces(full_ns))
+        mounts = []
+        for mount, info in data.items():
+            if isinstance(info, dict) and info.get("type") == "kv":
+                mounts.append(mount)
+        return mounts
     except Exception as e:
-        print(f"[!] Could not list sub-namespaces under '{namespace}': {e}")
-    return namespaces
+        print(f"❌ Cannot get mounts: {e}")
+        return []
 
 
-def get_mounts(namespace):
-    headers = {"X-Vault-Namespace": namespace} if namespace else {}
-    response = client.adapter.get("/v1/sys/mounts", headers=headers)
-    data = response if isinstance(response, dict) else response.json()
-    mounts = []
-    for path, mount_info in data.items():
-        if isinstance(mount_info, dict) and mount_info.get("type") == "kv":
-            mounts.append(path)
-    return mounts
-
-
-def export_secrets_to_csv(root_namespace=""):
-    all_namespaces = list_subnamespaces(root_namespace)
-
+def export_to_csv():
+    mounts = get_kv_mounts()
     with open("vault_secrets.csv", "w", newline="") as csvfile:
-        fieldnames = ["Namespace", "Mount Path", "Secret Path", "KV Version"]
+        fieldnames = ["Mount Path", "Secret Path", "KV Version"]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
 
-        for namespace in all_namespaces:
-            print(f"🔍 Checking namespace: {namespace or '[root]'}")
-
-            headers = {"X-Vault-Namespace": namespace} if namespace else {}
+        for mount in mounts:
             try:
-                mounts = get_mounts(namespace)
+                is_v2 = is_kv_v2(mount)
+                print(f"🔍 Scanning {mount} ({'v2' if is_v2 else 'v1'}) in namespace {VAULT_NAMESPACE or '[root]'}")
+                secrets = list_secrets_recursively(mount, is_v2=is_v2)
+                for secret_path in secrets:
+                    writer.writerow({
+                        "Mount Path": mount,
+                        "Secret Path": secret_path,
+                        "KV Version": "v2" if is_v2 else "v1"
+                    })
             except Exception as e:
-                print(f"❌ Skipping namespace '{namespace}' due to mount read error: {e}")
-                continue
-
-            for mount in mounts:
-                try:
-                    is_v2 = is_kv_v2(mount)
-                    secrets = list_secrets_recursively(mount, is_v2=is_v2)
-
-                    for mount_path, secret_path in secrets:
-                        writer.writerow({
-                            "Namespace": namespace,
-                            "Mount Path": mount_path,
-                            "Secret Path": secret_path,
-                            "KV Version": "v2" if is_v2 else "v1"
-                        })
-                except Exception as e:
-                    print(f"⚠️ Error reading from mount '{mount}' in namespace '{namespace}': {e}")
+                print(f"⚠️ Error with mount {mount}: {e}")
 
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Export Vault secrets paths to CSV.")
-    parser.add_argument("--namespace", type=str, help="Root Vault namespace", default="")
-    args = parser.parse_args()
-
-    export_secrets_to_csv(args.namespace.strip("/"))
+    export_to_csv()
