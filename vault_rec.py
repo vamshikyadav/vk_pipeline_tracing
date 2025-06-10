@@ -46,7 +46,7 @@ def get_kv_mounts():
     try:
         response = client.adapter.get("/v1/sys/mounts", headers=headers)
         mounts = response.json()
-        return [m for m in mounts if mounts[m]["type"] == "kv"]
+        return [m for m in mounts if mounts[m].get("type") == "kv"]
     except Exception as e:
         print(f"❌ Could not get mounts: {e}")
         return []
