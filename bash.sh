@@ -17,59 +17,83 @@ detect_kv_version() {
     fi
 }
 
+# For kv-v1, we use vault read directly on the path
+dump_kv_v1_secret_keys() {
+    local engine=$1
+    local path=$2
+    full_path="${engine}${path}"
+    keys=$(vault read -format=json "$full_path" 2>/dev/null | jq -r '.data | keys[]' 2>/dev/null)
+
+    for k in $keys; do
+        echo "kv-v1,$engine,/$path,$k" >> "$OUTPUT_FILE"
+    done
+}
+
+# For kv-v2, we use vault kv get on data/ path
+dump_kv_v2_secret_keys() {
+    local engine=$1
+    local path=$2
+    full_path="${engine}data/${path}"
+    keys=$(vault read -format=json "$full_path" 2>/dev/null | jq -r '.data.data | keys[]' 2>/dev/null)
+
+    for k in $keys; do
+        echo "kv-v2,$engine,/$path,$k" >> "$OUTPUT_FILE"
+    done
+}
+
 # Recursive traversal for kv-v1
-list_kv_v1() {
+traverse_kv_v1() {
     local engine=$1
     local path=$2
 
-    keys=$(vault list -format=json "${engine}${path}" 2>/dev/null)
+    children=$(vault list -format=json "${engine}${path}" 2>/dev/null)
 
     if [[ $? -ne 0 ]]; then
         return
     fi
 
-    for key in $(echo "$keys" | jq -r '.[]'); do
-        if [[ "$key" == */ ]]; then
-            list_kv_v1 "$engine" "${path}${key}"
+    for item in $(echo "$children" | jq -r '.[]'); do
+        if [[ "$item" == */ ]]; then
+            traverse_kv_v1 "$engine" "${path}${item}"
         else
-            echo "kv-v1,$engine,$path,$key" >> "$OUTPUT_FILE"
+            dump_kv_v1_secret_keys "$engine" "${path}${item}"
         fi
     done
 }
 
-# Recursive traversal for kv-v2 (metadata list)
-list_kv_v2() {
+# Recursive traversal for kv-v2
+traverse_kv_v2() {
     local engine=$1
     local path=$2
 
-    keys=$(vault list -format=json "${engine}metadata/${path}" 2>/dev/null)
+    children=$(vault list -format=json "${engine}metadata/${path}" 2>/dev/null)
 
     if [[ $? -ne 0 ]]; then
         return
     fi
 
-    for key in $(echo "$keys" | jq -r '.[]'); do
-        if [[ "$key" == */ ]]; then
-            list_kv_v2 "$engine" "${path}${key}"
+    for item in $(echo "$children" | jq -r '.[]'); do
+        if [[ "$item" == */ ]]; then
+            traverse_kv_v2 "$engine" "${path}${item}"
         else
-            echo "kv-v2,$engine,/${path},$key" >> "$OUTPUT_FILE"
+            dump_kv_v2_secret_keys "$engine" "${path}${item}"
         fi
     done
 }
 
-# MAIN: iterate over all secret mounts
+# MAIN
 vault secrets list -format=json | jq -r 'keys[]' | while read -r mount; do
-    engine=$(echo "$mount" | sed 's:/$::')  # e.g., "secret"
+    engine=$(echo "$mount" | sed 's:/$::')
     type=$(vault secrets list -format=json | jq -r ".[\"${mount}\"].type")
 
     if [[ "$type" == "kv" ]]; then
         version=$(detect_kv_version "$engine/")
         if [[ "$version" == "kv-v2" ]]; then
-            list_kv_v2 "$engine/" ""
+            traverse_kv_v2 "$engine/" ""
         else
-            list_kv_v1 "$engine/" ""
+            traverse_kv_v1 "$engine/" ""
         fi
     fi
 done
 
-echo "✅ Done! Output written to $OUTPUT_FILE"
+echo "✅ Finished! Output in: $OUTPUT_FILE"
